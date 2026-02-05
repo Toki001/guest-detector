@@ -5,38 +5,56 @@ import time
 import math
 import mediapipe as mp
 import datetime
+import os
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
-COLLECTION_ID = 'office_personnel'
-REGION = 'us-east-1'
-AWS_ACCESS_KEY = 'test'
-AWS_SECRET_KEY = 'test'
+# CONFIGURATION
+load_dotenv() # Load secrets from .env file
+REGION = os.getenv('AWS_REGION')
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+COLLECTION_ID = os.getenv('COLLECTION_ID', 'office_personnel')
 
-# Motion & Timing Config
-REQUIRED_STILL_TIME = 5     # Seconds of stillness required before sending to AWS
-MOVEMENT_THRESHOLD = 50     # Pixel drift allowed before resetting timer
+# Tuning Parameters
+REQUIRED_STILL_TIME = 5.0
+MOVEMENT_THRESHOLD = 60
+SUCCESS_LOCK_TIME = 2.0
+PADDING = 50          
 
-# --- SETUP AWS ---
-rekognition = boto3.client('rekognition', 
-                           region_name=REGION,
-                           aws_access_key_id=AWS_ACCESS_KEY, 
-                           aws_secret_access_key=AWS_SECRET_KEY)
+# SETUP AWS
+# Safety check to prevent crashing if keys are missing
+if AWS_ACCESS_KEY and AWS_SECRET_KEY:
+    try:
+        rekognition = boto3.client('rekognition', 
+                                   region_name=REGION,
+                                   aws_access_key_id=AWS_ACCESS_KEY, 
+                                   aws_secret_access_key=AWS_SECRET_KEY)
+    except Exception as e:
+        print(f"AWS Init Error: {e}")
+        rekognition = None
+else:
+    print("WARNING: AWS Keys missing in .env file.")
+    rekognition = None
 
-# --- SETUP MEDIAPIPE ---
+# SETUP MEDIAPIPE
 mp_face_detection = mp.solutions.face_detection
 face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.6)
 
-# Global variables for thread communication
-current_status = "Waiting for subject..."
+# Global variables
+scan_result_message = ""       # Stores the text result from AWS
 status_color = (255, 255, 255) # White
-is_processing_aws = False      # Lock to prevent double-sending
 
 def check_face_identity(image_bytes):
     """
-    Runs in a background thread to identify the face via AWS.
+    Runs in background thread: Sends image to AWS and updates global status.
     """
-    global current_status, status_color, is_processing_aws
+    global scan_result_message, status_color
     
+    if not rekognition:
+        scan_result_message = "AWS NOT CONFIGURED"
+        status_color = (0, 165, 255)
+        return
+
     try:
         response = rekognition.search_faces_by_image(
             CollectionId=COLLECTION_ID,
@@ -48,27 +66,22 @@ def check_face_identity(image_bytes):
         face_matches = response['FaceMatches']
         
         if not face_matches:
-            # GUEST DETECTED
-            current_status = "ALERT: GUEST DETECTED"
+            # GUEST
+            scan_result_message = "ALERT: UNKNOWN GUEST"
             status_color = (0, 0, 255) # Red
-            print(f"[{datetime.datetime.now()}] Unknown person detected!")
+            print(f"[{datetime.datetime.now()}] AWS Result: Guest Detected")
         else:
-            # EMPLOYEE DETECTED
+            # EMPLOYEE
             name = face_matches[0]['Face']['ExternalImageId']
             confidence = face_matches[0]['Similarity']
-            current_status = f"Access Granted: {name} ({int(confidence)}%)"
+            scan_result_message = f"ACCESS GRANTED: {name}"
             status_color = (0, 255, 0) # Green
-            print(f"[{datetime.datetime.now()}] Recognized: {name}")
+            print(f"[{datetime.datetime.now()}] AWS Result: {name}")
 
     except Exception as e:
         print(f"AWS Error: {e}")
-        current_status = "API Error"
+        scan_result_message = "API ERROR"
         status_color = (0, 165, 255) # Orange
-    
-    finally:
-        # Unlock the system so it can scan again if needed
-        time.sleep(2) # Keep the result on screen for 2 seconds
-        is_processing_aws = False
 
 # --- HELPER FUNCTIONS ---
 def get_center(x, y, w, h):
@@ -80,101 +93,118 @@ def get_distance(p1, p2):
 # --- MAIN LOOP ---
 video_capture = cv2.VideoCapture(0)
 
-# State Variables
-anchor_center = None        # The (x,y) point where they started standing still
-still_start_time = None     # When they started standing still
+anchor_center = None
+still_start_time = None
+system_lock_until = 0  # Controls the freeze after capture
 
-print("System Armed. Hold still for 5 seconds to scan.")
+print(f"System Active. Padding: {PADDING}px. Box shows capture area.")
 
 while True:
     ret, frame = video_capture.read()
     if not ret: break
 
-    # 1. PREPARE FRAME (MediaPipe needs RGB)
+    current_time = time.time()
+    h_img, w_img, _ = frame.shape 
+
+    # =======================================================
+    # 1. LOCK SYSTEM IF "CAPTURED" IS SHOWING
+    # =======================================================
+    if current_time < system_lock_until:
+        # Show the result text (or "Processing..." if AWS is slow)
+        display_text = scan_result_message if scan_result_message else "Processing..."
+        
+        # Draw a banner background for readability
+        cv2.rectangle(frame, (0, 0), (w_img, 80), (0, 0, 0), -1)
+        cv2.putText(frame, display_text, (20, 55), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 3)
+        
+        cv2.imshow('Smart Security Feed', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        continue  # SKIP EVERYTHING ELSE
+
+    # =======================================================
+    # 2. NORMAL DETECTION LOGIC
+    # =======================================================
+    
+    # Reset message for new scan
+    scan_result_message = ""
+    
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_detection.process(rgb_frame)
 
-    # UI Header
-    cv2.putText(frame, f"System: {current_status}", (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
-    # 2. LOGIC: NO FACES FOUND
+    # A. NO FACES
     if not results.detections:
-        if not is_processing_aws:
-            anchor_center = None
-            still_start_time = None
-            current_status = "Waiting for subject..."
-            status_color = (255, 255, 255)
-
-    # 3. LOGIC: FACES FOUND
+        anchor_center = None
+        still_start_time = None
+        cv2.putText(frame, "Waiting for subject...", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # B. FACES FOUND
     else:
         for detection in results.detections:
-            # Convert Relative Coords -> Pixel Coords
-            h_img, w_img, _ = frame.shape
+            # 1. Get TIGHT Coordinates (from MediaPipe)
             bboxC = detection.location_data.relative_bounding_box
             x = int(bboxC.xmin * w_img)
             y = int(bboxC.ymin * h_img)
-            w = int(bboxC.width * w_img)
-            h = int(bboxC.height * h_img)
+            w_box = int(bboxC.width * w_img)
+            h_box = int(bboxC.height * h_img)
             
-            # Safety Clamp (Prevent crashes if face is half off-screen)
-            x, y = max(0, x), max(0, y)
+            # 2. Calculate PADDED Coordinates (The capture area)
+            x1 = max(0, x - PADDING)
+            y1 = max(0, y - PADDING)
+            x2 = min(w_img, x + w_box + PADDING)
+            y2 = min(h_img, y + h_box + PADDING)
 
-            # Draw Box
-            cv2.rectangle(frame, (x, y), (x+w, y+h), status_color, 2)
-
-            # Skip logic if we are currently talking to AWS
-            if is_processing_aws:
-                continue
-
-            current_center = get_center(x, y, w, h)
-            current_time = time.time()
+            # 3. Calculate Center (using tight box for accuracy)
+            current_center = get_center(x, y, w_box, h_box)
 
             # Initialize Anchor
             if anchor_center is None:
                 anchor_center = current_center
                 still_start_time = current_time
 
-            # Calculate Drift
             drift = get_distance(current_center, anchor_center)
+            
+            # --- DRAW THE PADDED BOX ---
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
 
-            # BRANCH A: MOVED TOO MUCH (RESET)
+            # --- MOTION CHECK ---
             if drift > MOVEMENT_THRESHOLD:
                 anchor_center = current_center
                 still_start_time = current_time
-                current_status = "MOVEMENT - RESETTING..."
-                status_color = (0, 165, 255) # Orange
-
-            # BRANCH B: HOLDING STILL
+                cv2.putText(frame, "MOVEMENT - RESET", (x1, y1-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             else:
                 time_still = current_time - still_start_time
                 
-                # BRANCH B1: 5 SECONDS REACHED -> SEND TO AWS
+                # --- SNAP PHOTO TRIGGER ---
                 if time_still >= REQUIRED_STILL_TIME:
-                    is_processing_aws = True # Lock system
-                    current_status = "Identifying..."
-                    status_color = (255, 255, 0) # Yellow
                     
-                    # Crop Face
-                    face_roi = frame[y:y+h, x:x+w]
-                    
-                    # Encode and Send
-                    if face_roi.size > 0:
-                        _, img_encoded = cv2.imencode('.jpg', face_roi)
+                    # CROP using the PADDED variables
+                    face_image = frame[y1:y2, x1:x2]
+
+                    if face_image.size > 0:
+                        # 1. Send to AWS
+                        _, img_encoded = cv2.imencode('.jpg', face_image)
                         image_bytes = img_encoded.tobytes()
                         threading.Thread(target=check_face_identity, args=(image_bytes,)).start()
-                    
-                    # Reset Anchor for next time
-                    anchor_center = None 
-                    still_start_time = None
-
-                # BRANCH B2: COUNTDOWN
+                        
+                        print(f"[{datetime.datetime.now()}] SNAP: Sending to AWS...")
+                        
+                        # 2. LOCK THE SYSTEM
+                        system_lock_until = current_time + SUCCESS_LOCK_TIME
+                        
+                        # 3. FORCE RESET VARIABLES
+                        anchor_center = None
+                        still_start_time = None
+                        
+                        # Break loop to apply lock immediately
+                        break 
                 else:
+                    # COUNTDOWN
                     remaining = int(REQUIRED_STILL_TIME - time_still) + 1
-                    cv2.putText(frame, f"Hold Still: {remaining}s", (x, y-10), 
+                    cv2.putText(frame, f"Hold Still: {remaining}s", (x1, y1-10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-                    current_status = "Verifying Stillness..."
-                    status_color = (255, 255, 255)
 
     cv2.imshow('Smart Security Feed', frame)
 
